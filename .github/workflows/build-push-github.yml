@@ -1,6 +1,5 @@
 #######################################################
 ### example for Github Container Registry (ghcr.io)
-### example for Docker Hub
 ###
 ### Your container image name will be:
 ###   ghcr.io/<github-account>/<repo-name>:latest
