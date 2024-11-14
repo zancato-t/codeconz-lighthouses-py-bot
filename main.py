@@ -1,15 +1,17 @@
-import time
 import argparse
-import grpc
 import random
+import time
 from concurrent import futures
-from grpc import RpcError
+
+import grpc
 from google.protobuf import json_format
+from grpc import RpcError
 
 from internal.handler.coms import game_pb2
 from internal.handler.coms import game_pb2_grpc as game_grpc
 
 timeout_to_response = 1  # 1 second
+
 
 class BotGameTurn:
     def __init__(self, turn, action):
@@ -43,17 +45,21 @@ class BotGame:
                         # No conectar si ya existe la conexión
                         # No conectar si no controlamos el destino
                         # Nota: no comprobamos si la conexión se cruza.
-                        if (dest != (cx, cy) and
-                            lighthouses[dest].HaveKey and
-                            [cx, cy] not in lighthouses[dest].Connections and
-                            lighthouses[dest].Owner == self.player_num):
+                        if (
+                            dest != (cx, cy)
+                            and lighthouses[dest].HaveKey
+                            and [cx, cy] not in lighthouses[dest].Connections
+                            and lighthouses[dest].Owner == self.player_num
+                        ):
                             possible_connections.append(dest)
 
                     if possible_connections:
                         possible_connection = random.choice(possible_connections)
                         action = game_pb2.NewAction(
                             Action=game_pb2.CONNECT,
-                            Destination=game_pb2.Position(X=possible_connection[0], Y=possible_connection[1])
+                            Destination=game_pb2.Position(
+                                X=possible_connection[0], Y=possible_connection[1]
+                            ),
                         )
                         bgt = BotGameTurn(turn, action)
                         self.turn_states.append(bgt)
@@ -61,32 +67,28 @@ class BotGame:
                         self.countT += 1
                         return action
 
-                # Probabilidad 60%: recargar el faro
-                if random.randrange(100) < 60:
-                    energy = random.randrange(turn.Energy + 1)
-                    action = game_pb2.NewAction(
-                        Action=game_pb2.ATTACK,
-                        Energy=energy,
-                        Destination=game_pb2.Position(
-                            X=turn.Position.X,
-                            Y=turn.Position.Y
-                        )
-                    )
-                    bgt = BotGameTurn(turn, action)
-                    self.turn_states.append(bgt)
+            # Probabilidad 60%: recargar el faro
+            if random.randrange(100) < 60:
+                energy = random.randrange(turn.Energy + 1)
+                action = game_pb2.NewAction(
+                    Action=game_pb2.ATTACK,
+                    Energy=energy,
+                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+                )
+                bgt = BotGameTurn(turn, action)
+                self.turn_states.append(bgt)
 
-                    self.countT += 1
-                    return action
+                self.countT += 1
+                return action
 
         # Mover aleatoriamente
-        moves = ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1))
+        moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
         move = random.choice(moves)
         action = game_pb2.NewAction(
             Action=game_pb2.MOVE,
             Destination=game_pb2.Position(
-                X=turn.Position.X + move[0],
-                Y=turn.Position.Y + move[1]
-            )
+                X=turn.Position.X + move[0], Y=turn.Position.Y + move[1]
+            ),
         )
 
         bgt = BotGameTurn(turn, action)
@@ -122,14 +124,13 @@ class BotComs:
                 print(f"Could not join game: {e.details()}")
                 time.sleep(1)
 
-
     def start_listening(self):
         print("Starting to listen on", self.my_address)
 
         # configure gRPC server
         grpc_server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=10),
-            interceptors=(ServerInterceptor(),)
+            interceptors=(ServerInterceptor(),),
         )
 
         # registry of the service

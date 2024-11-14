@@ -57,3 +57,5 @@ jobs:
         with:
           push: true
           tags: ${{ env.REGISTRY }}/${{env.IMAGE_NAME}}
+          build-args: |
+            BOT_NAME=${{ github.repository_owner }}-${{ github.event.repository.name }}
