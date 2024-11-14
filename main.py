@@ -35,51 +35,49 @@ class BotGame:
 
         # Si estamos en un faro...
         if (cx, cy) in lighthouses:
-            # Probabilidad 60%: conectar con faro remoto válido
+            # Conectar con faro remoto válido siempre que se pueda
             if lighthouses[(cx, cy)].Owner == self.player_num:
-                if random.randrange(100) < 60:
-                    possible_connections = []
-                    for dest in lighthouses:
-                        # No conectar con sigo mismo
-                        # No conectar si no tenemos la clave
-                        # No conectar si ya existe la conexión
-                        # No conectar si no controlamos el destino
-                        # Nota: no comprobamos si la conexión se cruza.
-                        if (
-                            dest != (cx, cy)
-                            and lighthouses[dest].HaveKey
-                            and [cx, cy] not in lighthouses[dest].Connections
-                            and lighthouses[dest].Owner == self.player_num
-                        ):
-                            possible_connections.append(dest)
+                possible_connections = []
+                for dest in lighthouses:
+                    # No conectar con sigo mismo
+                    # No conectar si no tenemos la clave
+                    # No conectar si ya existe la conexión
+                    # No conectar si no controlamos el destino
+                    # Nota: no comprobamos si la conexión se cruza.
+                    if (
+                        dest != (cx, cy)
+                        and lighthouses[dest].HaveKey
+                        and [cx, cy] not in lighthouses[dest].Connections
+                        and lighthouses[dest].Owner == self.player_num
+                    ):
+                        possible_connections.append(dest)
 
-                    if possible_connections:
-                        possible_connection = random.choice(possible_connections)
-                        action = game_pb2.NewAction(
-                            Action=game_pb2.CONNECT,
-                            Destination=game_pb2.Position(
-                                X=possible_connection[0], Y=possible_connection[1]
-                            ),
-                        )
-                        bgt = BotGameTurn(turn, action)
-                        self.turn_states.append(bgt)
+                if possible_connections:
+                    possible_connection = random.choice(possible_connections)
+                    action = game_pb2.NewAction(
+                        Action=game_pb2.CONNECT,
+                        Destination=game_pb2.Position(
+                            X=possible_connection[0], Y=possible_connection[1]
+                        ),
+                    )
+                    bgt = BotGameTurn(turn, action)
+                    self.turn_states.append(bgt)
 
-                        self.countT += 1
-                        return action
+                    self.countT += 1
+                    return action
 
-            # Probabilidad 60%: recargar el faro
-            if random.randrange(100) < 60:
-                energy = random.randrange(turn.Energy + 1)
-                action = game_pb2.NewAction(
-                    Action=game_pb2.ATTACK,
-                    Energy=energy,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
+            # Atacar el faro siempre que se pueda
+            energy = random.randrange(turn.Energy + 1)
+            action = game_pb2.NewAction(
+                Action=game_pb2.ATTACK,
+                Energy=energy,
+                Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+            )
+            bgt = BotGameTurn(turn, action)
+            self.turn_states.append(bgt)
 
-                self.countT += 1
-                return action
+            self.countT += 1
+            return action
 
         # Mover aleatoriamente
         moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
