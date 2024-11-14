@@ -60,7 +60,6 @@ class BotGame:
                             X=possible_connection[0], Y=possible_connection[1]
                         ),
                     )
-                    print(f"Creating connection {action}")
                     bgt = BotGameTurn(turn, action)
                     self.turn_states.append(bgt)
 
