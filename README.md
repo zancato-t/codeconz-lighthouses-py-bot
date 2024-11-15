@@ -14,6 +14,22 @@ The bot interacts with the game engine in three steps:
 
 For more in depth information on the game, please refer to the [Game Engine documentation](https://github.com/intelygenz/codeconz-lighthouses-engine/blob/master/README.md).
 
+## Configuration
+
+The needed configuration for the bot is embedded in the [entrypoint.sh](entrypoint.sh) file.
+```Dockerfile
+python3 ./main.py --bn=${BOT_NAME} --la=${BOT_NAME}:3001 --gs=game:50051
+```
+
+The bot is prepared so that you don't need to change anything, but if you want to, you can change the following parameters:
+- **Bot port**: The port where the bot will listen for the game engine requests. Defaults to `3001`.
+
+The next parameters are already set for you, and you don't need to change them:
+- **Bot name**: Defaults to the name of the owner + the name of the repository. For the template example it will be `intelygenz-codeconz-lighthouses-go-bot`.
+- **Game engine address**: The address where the game engine is listening for the bot requests. Defaults to `game:50051`.
+
+
+
 ## Run locally
 
 To run the bot locally, you need to have Python 3.7 or higher installed on your
