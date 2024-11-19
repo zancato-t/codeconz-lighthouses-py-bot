@@ -7,11 +7,7 @@
 #######################################################
 #######################################################
 
-#######################################################
-### Uncomment all lines below to use this template  ###
-#######################################################
-
-name: "Docker build & push - GHCR"
+name: "Docker build & push"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -25,7 +21,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}:latest
 
 jobs:
   docker-build-push:
@@ -35,6 +30,10 @@ jobs:
       contents: read
 
     steps:
+      - name: Set vars
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}:latest" >>${GITHUB_ENV}
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
