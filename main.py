@@ -2,6 +2,7 @@ import argparse
 import random
 import time
 from concurrent import futures
+from collections import defaultdict
 
 import grpc
 from google.protobuf import json_format
@@ -33,6 +34,9 @@ class BotGame:
         self.known_lighthouse_positions = set()  # Track all lighthouse positions
         self.turns_on_lighthouse = 0  # Track how long we've been on same lighthouse
         self.last_lighthouse_pos = None  # Track last lighthouse position
+        self.enemy_lighthouses = defaultdict(set)  # player_id -> set of (x,y) positions
+        self.turn_number = 0  # Track game progression
+        self.enemy_connections = defaultdict(list)  # Track enemy connections for disruption
 
     def calculate_triangle_potential(self, new_pos, owned_lighthouses):
         """Calculate potential triangle area if we capture this lighthouse"""
@@ -62,6 +66,62 @@ class BotGame:
         x2, y2 = p2
         x3, y3 = p3
         return abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2.0)
+    
+    def would_complete_enemy_triangle(self, pos, enemy_id):
+        """Check if capturing this lighthouse would break an enemy triangle opportunity"""
+        enemy_lhs = self.enemy_lighthouses.get(enemy_id, set())
+        if len(enemy_lhs) < 2:
+            return False
+        
+        # Check if this position would form a triangle with any two enemy lighthouses
+        enemy_list = list(enemy_lhs)
+        for i in range(len(enemy_list)):
+            for j in range(i + 1, len(enemy_list)):
+                area = self.calculate_triangle_area(pos, enemy_list[i], enemy_list[j])
+                if area > 50:  # Significant triangle
+                    return True
+        return False
+    
+    def predict_capture_turns(self, lighthouse, our_energy):
+        """Predict how many turns until we could capture this lighthouse"""
+        if lighthouse.Owner == 0:  # Unowned
+            return 0 if our_energy > lighthouse.Energy else 999
+        
+        # Owned lighthouses lose 10 energy per turn
+        energy_decay_rate = 10
+        current_energy = lighthouse.Energy
+        turns = 0
+        
+        while current_energy >= our_energy and turns < 10:
+            current_energy -= energy_decay_rate
+            turns += 1
+        
+        return turns if current_energy < our_energy else 999
+    
+    def get_cluster_density(self, pos, radius=3):
+        """Count lighthouses within radius of position"""
+        count = 0
+        px, py = pos
+        for lh_pos in self.known_lighthouse_positions:
+            lx, ly = lh_pos
+            if abs(px - lx) <= radius and abs(py - ly) <= radius:
+                count += 1
+        return count
+    
+    def line_intersects(self, p1, p2, p3, p4):
+        """Check if line segment p1-p2 intersects with p3-p4"""
+        def ccw(A, B, C):
+            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+        
+        # Check if segments intersect
+        return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
+    
+    def would_connection_cross(self, from_pos, to_pos, existing_connections):
+        """Check if a new connection would cross existing ones"""
+        for conn_pair in existing_connections:
+            if self.line_intersects(from_pos, to_pos, conn_pair[0], conn_pair[1]):
+                return True
+        return False
 
     def find_best_connection(self, current_pos, owned_lighthouses):
         """Find the connection that creates the largest triangle area"""
@@ -119,6 +179,7 @@ class BotGame:
         
         self.lastY = cy
         self.lastX = cx
+        self.turn_number += 1
         
         # Track time on lighthouse
         current_pos = (cx, cy)
@@ -128,18 +189,29 @@ class BotGame:
             self.turns_on_lighthouse = 0
             
         lighthouses = dict()
+        # Clear enemy tracking for fresh update
+        self.enemy_lighthouses.clear()
+        
         for lh in turn.Lighthouses:
             pos = (lh.Position.X, lh.Position.Y)
             lighthouses[pos] = lh
             # Memorize all lighthouse positions we've seen
             self.known_lighthouse_positions.add(pos)
+            
+            # Track enemy lighthouses
+            if lh.Owner != 0 and lh.Owner != self.player_num:
+                self.enemy_lighthouses[lh.Owner].add(pos)
+                # Track enemy connections too
+                for conn in lh.Connections:
+                    conn_pos = (conn.X, conn.Y)
+                    self.enemy_connections[lh.Owner].append((pos, conn_pos))
 
         if (cx, cy) in lighthouses:
             self.last_lighthouse_pos = current_pos
             
-            # Force movement if we've been camping too long (3 turns max)
-            if self.turns_on_lighthouse >= 3:
-                # Skip to movement logic below
+            # Force movement if we've been camping too long (1 turn max for 12-player ultra-aggression)
+            if self.turns_on_lighthouse >= 1:
+                # Skip to movement logic below - ALWAYS BE MOVING!
                 pass
             # Conectar con faro remoto válido si podemos
             elif lighthouses[(cx, cy)].Owner == self.player_num:
@@ -161,26 +233,41 @@ class BotGame:
                 if possible_connections:
                     owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
                     
-                    best_connection = self.find_best_connection((cx, cy), owned_lighthouses)
+                    # Get all existing connections for validation
+                    all_connections = []
+                    for lh in owned_lighthouses:
+                        lh_pos = (lh.Position.X, lh.Position.Y)
+                        for conn in lh.Connections:
+                            conn_pos = (conn.X, conn.Y)
+                            all_connections.append((lh_pos, conn_pos))
                     
-                    if best_connection and best_connection in possible_connections:
-                        possible_connection = best_connection
-                    else:
-                        possible_connection = random.choice(possible_connections)
-                    action = game_pb2.NewAction(
-                        Action=game_pb2.CONNECT,
-                        Destination=game_pb2.Position(
-                            X=possible_connection[0], Y=possible_connection[1]
-                        ),
-                    )
-                    bgt = BotGameTurn(turn, action)
-                    self.turn_states.append(bgt)
+                    # Filter out connections that would cross existing ones
+                    valid_connections = []
+                    for dest in possible_connections:
+                        if not self.would_connection_cross((cx, cy), dest, all_connections):
+                            valid_connections.append(dest)
+                    
+                    if valid_connections:
+                        best_connection = self.find_best_connection((cx, cy), owned_lighthouses)
+                        
+                        if best_connection and best_connection in valid_connections:
+                            possible_connection = best_connection
+                        else:
+                            possible_connection = random.choice(valid_connections)
+                        action = game_pb2.NewAction(
+                            Action=game_pb2.CONNECT,
+                            Destination=game_pb2.Position(
+                                X=possible_connection[0], Y=possible_connection[1]
+                            ),
+                        )
+                        bgt = BotGameTurn(turn, action)
+                        self.turn_states.append(bgt)
 
-                    self.countT += 1
-                    return action
+                        self.countT += 1
+                        return action
 
             # Skip attack if we've been camping too long
-            elif self.turns_on_lighthouse < 3:
+            elif self.turns_on_lighthouse < 1:  # Only attack on first turn at lighthouse
                 lighthouse_energy = lighthouses[(cx, cy)].Energy
                 if turn.Energy > lighthouse_energy:
                     min_energy = lighthouse_energy + 1
@@ -191,29 +278,42 @@ class BotGame:
                 is_edge = cx == 0 or cx == 14 or cy == 0 or cy == 14
                 owned_count = len([lh for lh in turn.Lighthouses if lh.Owner == self.player_num])
                 
-                # Base energy calculation
-                if energy_ratio >= 4.0:
-                    energy = min(min_energy + (lighthouse_energy // 2), turn.Energy // 2)
-                elif energy_ratio >= 2.5:
-                    energy = min(min_energy + (lighthouse_energy // 3), turn.Energy // 3)
-                elif energy_ratio >= 1.5:
-                    energy = min(min_energy + (lighthouse_energy // 4), max(turn.Energy - 30, min_energy))
-                else:
+                # Game phase-aware energy management
+                if self.turn_number < 10:
+                    # Early game: minimal investment, maximize expansion
                     energy = min_energy
+                    max_spend_ratio = 0.3  # Keep 70% for movement
+                elif self.turn_number < 30:
+                    # Mid game: balanced investment
+                    if energy_ratio >= 3.0:
+                        energy = min(min_energy + 10, turn.Energy // 3)
+                    else:
+                        energy = min_energy
+                    max_spend_ratio = 0.5  # Keep 50% for movement
+                else:
+                    # Late game: can invest more if strategic
+                    if energy_ratio >= 2.0:
+                        energy = min(min_energy + 20, turn.Energy // 2)
+                    else:
+                        energy = min_energy
+                    max_spend_ratio = 0.7  # Can spend more late game
                 
-                # Strategic adjustments
+                # Strategic position adjustments
                 if is_corner and owned_count < 2:
-                    # Invest more in first corners for triangle potential
-                    energy = min(energy + 20, turn.Energy - 10)
+                    # First corners are critical
+                    energy = min(energy + 15, turn.Energy * 0.6)
                 elif is_edge and owned_count < 4:
-                    # Moderate extra investment in edges
-                    energy = min(energy + 10, turn.Energy - 20)
+                    # Edges valuable for triangles
+                    energy = min(energy + 10, turn.Energy * 0.5)
                 
-                # More aggressive energy spending for expansion
-                if owned_count < 3 and energy > turn.Energy * 0.6:
-                    energy = int(turn.Energy * 0.5)  # Keep more energy for movement
-                elif owned_count < 6 and energy > turn.Energy * 0.7:
-                    energy = int(turn.Energy * 0.6)
+                # Hard cap based on game phase
+                max_allowed = int(turn.Energy * max_spend_ratio)
+                energy = min(energy, max_allowed)
+                
+                # Never go below movement reserve
+                min_reserve = 40 if self.turn_number < 30 else 20
+                if energy > turn.Energy - min_reserve:
+                    energy = max(min_energy, turn.Energy - min_reserve)
                     action = game_pb2.NewAction(
                         Action=game_pb2.ATTACK,
                         Energy=energy,
@@ -237,8 +337,8 @@ class BotGame:
             
             score = 0
             
-            # Distance penalty (reduced for more aggressive expansion)
-            score -= distance * 1.0
+            # Distance penalty (minimal for ultra-aggressive expansion)
+            score -= distance * 0.5
             
             # Strategic position bonuses
             if (lh_x, lh_y) in self.corner_positions:
@@ -256,16 +356,37 @@ class BotGame:
                 # Center positions for connectivity
                 score += 25
             
+            # Turn-aware strategy phases
+            if self.turn_number < 10:
+                # Early game: prioritize corners and edges
+                strategy_multiplier = 1.5 if (lh_x, lh_y) in self.corner_positions else 1.0
+            elif self.turn_number < 30:
+                # Mid game: focus on triangle formation
+                strategy_multiplier = 1.2
+            else:
+                # Late game: consolidate and disrupt
+                strategy_multiplier = 0.8
+            
             # Ownership status (12-player ultra-aggressive priorities)
             if lh.Owner == 0:  # Unowned - absolute top priority
-                score += 150  # Massive bonus for new territory
+                score += 150 * strategy_multiplier  # Massive bonus for new territory
             elif lh.Owner != self.player_num:  # Enemy owned - steal aggressively
-                score += 100  # High priority to disrupt enemies
-                # Ultra-aggressive stealing (attack with ANY advantage)
-                if turn.Energy > lh.Energy - 5:
-                    score += 60  # Attack even at slight disadvantage
-                elif turn.Energy > lh.Energy - 15:
-                    score += 30
+                score += 100 * strategy_multiplier  # High priority to disrupt enemies
+                
+                # Check if this breaks enemy triangle opportunity
+                for enemy_id in self.enemy_lighthouses:
+                    if self.would_complete_enemy_triangle((lh_x, lh_y), enemy_id):
+                        score += 200  # HUGE bonus for disruption
+                        break
+                
+                # Ultra-aggressive stealing based on energy prediction
+                capture_turns = self.predict_capture_turns(lh, turn.Energy)
+                if capture_turns == 0:
+                    score += 80  # Can capture now
+                elif capture_turns <= 2:
+                    score += 50  # Can capture soon
+                elif capture_turns <= 4:
+                    score += 20  # Worth positioning for
             else:  # Already ours - strong penalty to force constant expansion
                 score -= 60  # Big negative to prevent camping
                 # Small exception for strategic positions
@@ -286,6 +407,13 @@ class BotGame:
             if len(owned_lighthouses) >= 1:
                 triangle_bonus = self.calculate_triangle_potential((lh_x, lh_y), owned_lighthouses)
                 score += triangle_bonus
+            
+            # Cluster density bonus - control areas with many lighthouses
+            cluster_density = self.get_cluster_density((lh_x, lh_y), radius=3)
+            if cluster_density >= 4:
+                score += 40  # Dense area bonus
+            elif cluster_density >= 2:
+                score += 20  # Moderate density bonus
             
             if score > best_score:
                 best_score = score
