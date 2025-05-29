@@ -46,6 +46,8 @@ class BotGame:
         self.enemy_lighthouse_control = {}  # Track enemy lighthouse control timing
         self.strategic_zones = set()  # High-value strategic positions
         self.connection_threats = []  # Enemy connection attempts to block
+        self.lighthouse_target_queue = []  # Queue of lighthouse positions to visit
+        self.current_target_index = 0  # Current target in rotation
 
     def calculate_triangle_area(self, p1, p2, p3):
         x1, y1 = p1
@@ -275,6 +277,68 @@ class BotGame:
                         
         return sorted(blocking_positions, key=lambda x: x[1], reverse=True)
 
+    def update_lighthouse_rotation_queue(self, lighthouses):
+        """Update the lighthouse rotation queue with known lighthouse positions"""
+        all_lighthouse_positions = list(self.known_lighthouse_positions)
+        
+        if not self.lighthouse_target_queue:
+            # Initialize queue with all known lighthouses, prioritizing corners first
+            corner_lighthouses = [pos for pos in all_lighthouse_positions if pos in self.corner_positions]
+            edge_lighthouses = [pos for pos in all_lighthouse_positions 
+                              if pos not in self.corner_positions and 
+                              (pos[0] == 0 or pos[0] == 14 or pos[1] == 0 or pos[1] == 14)]
+            other_lighthouses = [pos for pos in all_lighthouse_positions 
+                               if pos not in corner_lighthouses and pos not in edge_lighthouses]
+            
+            # Prioritize: corners -> edges -> others
+            self.lighthouse_target_queue = corner_lighthouses + edge_lighthouses + other_lighthouses
+        else:
+            # Add any new lighthouse positions we've discovered
+            for pos in all_lighthouse_positions:
+                if pos not in self.lighthouse_target_queue:
+                    self.lighthouse_target_queue.append(pos)
+    
+    def get_next_lighthouse_target(self, current_pos, lighthouses):
+        """Get the next lighthouse target in rotation that makes strategic sense"""
+        if not self.lighthouse_target_queue:
+            return None
+            
+        # Filter out lighthouses we already control and don't need to revisit
+        owned_lighthouses = {(lh.Position.X, lh.Position.Y) for lh in lighthouses.values() 
+                           if lh.Owner == self.player_num}
+        
+        # Look for the next uncontrolled lighthouse in our queue
+        attempts = 0
+        while attempts < len(self.lighthouse_target_queue):
+            if self.current_target_index >= len(self.lighthouse_target_queue):
+                self.current_target_index = 0  # Wrap around
+                
+            target_pos = self.lighthouse_target_queue[self.current_target_index]
+            
+            # Skip if we already own this lighthouse and it doesn't need defense
+            if target_pos in owned_lighthouses:
+                # Check if this lighthouse needs defense
+                needs_defense = False
+                tx, ty = target_pos
+                for lh in lighthouses.values():
+                    if lh.Owner != self.player_num and lh.Owner != 0:
+                        enemy_distance = abs(lh.Position.X - tx) + abs(lh.Position.Y - ty)
+                        if enemy_distance <= 4:  # Enemy nearby
+                            needs_defense = True
+                            break
+                
+                if not needs_defense:
+                    self.current_target_index += 1
+                    attempts += 1
+                    continue
+            
+            # This is a good target
+            return target_pos
+            
+        # If we've checked all lighthouses and they're all owned, start over
+        self.current_target_index = 0
+        return self.lighthouse_target_queue[0] if self.lighthouse_target_queue else None
+
     def find_best_connection(self, current_pos, owned_lighthouses):
         cx, cy = current_pos
         
@@ -368,6 +432,9 @@ class BotGame:
                     
         # Update strategic zones based on current game state
         self.update_strategic_zones(lighthouses)
+        
+        # Update lighthouse rotation queue with newly discovered lighthouses
+        self.update_lighthouse_rotation_queue(lighthouses)
 
         if (cx, cy) in lighthouses:
             # Conectar con faro remoto válido si podemos
@@ -418,139 +485,148 @@ class BotGame:
 
                     self.countT += 1
                     return action
-
-            lighthouse_energy = lighthouses[(cx, cy)].Energy
-            if turn.Energy > lighthouse_energy:
-                min_energy = lighthouse_energy + 1
                 
-                # Use optimized energy allocation
-                optimal_energy = self.optimize_energy_allocation(turn, min_energy + lighthouse_energy)
+                # If no connections possible and we own this lighthouse, consider moving away
+                # to find new targets instead of staying put
+                current_turn = len(self.turn_history)
+                owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
                 
-                if optimal_energy >= min_energy:
-                    energy = min(optimal_energy, turn.Energy - self.energy_reserve)
+                # Only stay if this lighthouse needs defense or we have few lighthouses
+                should_defend = False
+                if len(owned_lighthouses) <= 2:  # Keep defending if we have few lighthouses
+                    should_defend = True
                 else:
-                    energy = min_energy
-                action = game_pb2.NewAction(
-                    Action=game_pb2.ATTACK,
-                    Energy=energy,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
+                    # Check if enemies are nearby threatening this lighthouse
+                    for lh in turn.Lighthouses:
+                        if lh.Owner != self.player_num and lh.Owner != 0:
+                            enemy_distance = abs(lh.Position.X - cx) + abs(lh.Position.Y - cy)
+                            if enemy_distance <= 3:  # Enemy is close
+                                should_defend = True
+                                break
+                
+                # If we don't need to defend, move away to find new targets
+                if not should_defend:
+                    # Skip to movement logic below
+                    pass
+                else:
+                    # Stay and defend - continue with attack/pass logic
+                    lighthouse_energy = lighthouses[(cx, cy)].Energy
+                    if turn.Energy > lighthouse_energy:
+                        min_energy = lighthouse_energy + 1
+                        
+                        # Use optimized energy allocation
+                        optimal_energy = self.optimize_energy_allocation(turn, min_energy + lighthouse_energy)
+                        
+                        if optimal_energy >= min_energy:
+                            energy = min(optimal_energy, turn.Energy - self.energy_reserve)
+                        else:
+                            energy = min_energy
+                        action = game_pb2.NewAction(
+                            Action=game_pb2.ATTACK,
+                            Energy=energy,
+                            Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+                        )
+                        bgt = BotGameTurn(turn, action)
+                        self.turn_states.append(bgt)
 
-                self.countT += 1
-                return action
+                        self.countT += 1
+                        return action
+                    else:
+                        action = game_pb2.NewAction(
+                            Action=game_pb2.PASS,
+                            Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+                        )
+                        bgt = BotGameTurn(turn, action)
+                        self.turn_states.append(bgt)
+
+                        self.countT += 1
+                        return action
             else:
-                action = game_pb2.NewAction(
-                    Action=game_pb2.PASS,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
+                # Not our lighthouse, try to attack it
+                lighthouse_energy = lighthouses[(cx, cy)].Energy
+                if turn.Energy > lighthouse_energy:
+                    min_energy = lighthouse_energy + 1
+                    
+                    # Use optimized energy allocation
+                    optimal_energy = self.optimize_energy_allocation(turn, min_energy + lighthouse_energy)
+                    
+                    if optimal_energy >= min_energy:
+                        energy = min(optimal_energy, turn.Energy - self.energy_reserve)
+                    else:
+                        energy = min_energy
+                    action = game_pb2.NewAction(
+                        Action=game_pb2.ATTACK,
+                        Energy=energy,
+                        Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+                    )
+                    bgt = BotGameTurn(turn, action)
+                    self.turn_states.append(bgt)
 
-                self.countT += 1
-                return action
+                    self.countT += 1
+                    return action
+                else:
+                    # Not enough energy to attack, move away to find easier targets
+                    pass
 
-        # Enhanced lighthouse targeting with multiple strategies
-        best_lighthouse = None
-        best_score = float('-inf')
+        # Systematic lighthouse targeting using rotation queue
         current_turn = len(self.turn_history)
-        
-        # Check for blocking opportunities first
-        blocking_positions = self.find_blocking_positions(turn)
         owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
         
+        # Get next lighthouse target from rotation system
+        rotation_target = self.get_next_lighthouse_target((cx, cy), lighthouses)
+        
+        # If we have a rotation target, prefer it, but still check for urgent threats
+        best_lighthouse = rotation_target
+        blocking_positions = self.find_blocking_positions(turn)
+        
+        # Override rotation target if there are urgent strategic opportunities
+        urgent_targets = []
+        
+        # Check for high-priority targets that should override rotation
         for lh in turn.Lighthouses:
             lh_x, lh_y = lh.Position.X, lh.Position.Y
             lh_pos = (lh_x, lh_y)
             
-            # Use A* pathfinding for accurate distance calculation
-            obstacles = self.threat_zones.copy()
-            path = self.a_star_pathfind((cx, cy), lh_pos, obstacles)
+            # Skip if this is too far and we have a closer rotation target
+            distance_to_target = abs(cx - lh_x) + abs(cy - lh_y)
+            if rotation_target:
+                distance_to_rotation = abs(cx - rotation_target[0]) + abs(cy - rotation_target[1])
+                if distance_to_target > distance_to_rotation * 2:
+                    continue  # Too far, stick with rotation
             
-            if path is None:
-                continue  # No valid path
+            urgency_score = 0
+            
+            # Urgent: unowned corner lighthouses in early game
+            if (lh.Owner == 0 and lh_pos in self.corner_positions and 
+                current_turn < 25):
+                urgency_score += 200
                 
-            distance = len(path) - 1
-            score = 0
-            
-            # Dynamic distance penalty based on game phase
-            if current_turn < 15:  # Early game: explore more
-                score -= distance * 0.5
-            elif current_turn < 40:  # Mid game: balanced
-                score -= distance * 0.7
-            else:  # Late game: prefer closer targets
-                score -= distance * 1.0
-            
-            # Zone control value with game phase modifier
-            zone_value = self.calculate_zone_control_value(lh_pos, turn.Lighthouses)
-            if current_turn < 20:  # Early game bonus for corners
-                if lh_pos in self.corner_positions:
-                    zone_value += 50
-            score += zone_value
-            
-            # Blocking bonus
-            blocking_bonus = next((value for pos, value in blocking_positions if pos == lh_pos), 0)
-            score += blocking_bonus
-            
-            # Triangle potential scoring
-            triangle_potential = 0
-            if len(owned_lighthouses) >= 1:
-                for owned_lh in owned_lighthouses:
-                    owned_pos = (owned_lh.Position.X, owned_lh.Position.Y)
-                    if len(owned_lighthouses) >= 2:
-                        for other_owned in owned_lighthouses:
-                            other_pos = (other_owned.Position.X, other_owned.Position.Y)
-                            if owned_pos != other_pos:
-                                area = self.calculate_triangle_area(lh_pos, owned_pos, other_pos)
-                                triangle_potential = max(triangle_potential, area)
-            score += triangle_potential * 2
-            
-            # Ownership considerations with improved logic
-            if lh.Owner == 0:  # Unowned
-                base_unowned_bonus = 100
-                # Early game: prioritize corners and edges
-                if current_turn < 25 and lh_pos in self.corner_positions:
-                    base_unowned_bonus += 75
-                elif current_turn < 25 and (lh_x == 0 or lh_x == 14 or lh_y == 0 or lh_y == 14):
-                    base_unowned_bonus += 35
-                score += base_unowned_bonus
-                
-                # Bonus for distant exploration in early game
-                if current_turn < 20 and distance > 4:
-                    score += 30
-            elif lh.Owner != self.player_num:  # Enemy owned
-                base_enemy_bonus = 70
-                # Higher priority to disrupt enemy strongholds
-                enemy_lighthouse_count = len([l for l in turn.Lighthouses if l.Owner == lh.Owner])
-                if enemy_lighthouse_count >= 3:
-                    base_enemy_bonus += 25
-                score += base_enemy_bonus
-                
-                # Extra bonus for disrupting enemy triangles
-                if lh_pos in [pos for pos, _ in blocking_positions[:3]]:
-                    score += 50
-            else:  # Already ours
-                score += 20  # Slight bonus for reinforcing our positions
-            
-            # Improved energy efficiency calculation
+            # Urgent: enemy about to complete a large triangle
+            if lh.Owner != self.player_num and lh.Owner != 0:
+                blocking_bonus = next((value for pos, value in blocking_positions if pos == lh_pos), 0)
+                if blocking_bonus >= 50:  # High blocking value
+                    urgency_score += 150
+                    
+            # Urgent: easy target with good energy efficiency
             if lh.Owner != self.player_num:
-                required_energy = lh.Energy + 1
+                required_energy = lh.Energy + 1 if lh.Owner != 0 else 1
                 available_energy = self.optimize_energy_allocation(turn, required_energy)
-                
-                if available_energy >= required_energy:
-                    efficiency_bonus = min(20, (available_energy - required_energy) // 5)
-                    score += efficiency_bonus
-                else:
-                    energy_deficit = required_energy - available_energy
-                    score -= energy_deficit * 2  # Penalty for insufficient energy
+                if available_energy >= required_energy and distance_to_target <= 3:
+                    urgency_score += 100
             
-            if score > best_score:
-                best_score = score
-                best_lighthouse = lh_pos
+            if urgency_score >= 150:  # High urgency threshold
+                urgent_targets.append((lh_pos, urgency_score, distance_to_target))
+        
+        # Choose urgent target if any exist
+        if urgent_targets:
+            # Sort by urgency score, then by distance
+            urgent_targets.sort(key=lambda x: (-x[1], x[2]))
+            best_lighthouse = urgent_targets[0][0]
+            # Update rotation to next lighthouse since we're deviating
+            self.current_target_index = (self.current_target_index + 1) % max(1, len(self.lighthouse_target_queue))
         
         if best_lighthouse:
-            # Use A* pathfinding for movement
+            # Use A* pathfinding for movement toward lighthouse target
             obstacles = self.threat_zones.copy()
             path = self.a_star_pathfind((cx, cy), best_lighthouse, obstacles)
             
@@ -559,6 +635,12 @@ class BotGame:
                 dx = next_pos[0] - cx
                 dy = next_pos[1] - cy
                 move = (dx, dy)
+                
+                # If we're moving toward our rotation target, advance the index
+                if best_lighthouse == rotation_target:
+                    target_distance = abs(cx - best_lighthouse[0]) + abs(cy - best_lighthouse[1])
+                    if target_distance <= 2:  # Close to target, prepare next target
+                        self.current_target_index = (self.current_target_index + 1) % max(1, len(self.lighthouse_target_queue))
             else:
                 # Fallback to direct movement
                 target_x, target_y = best_lighthouse
