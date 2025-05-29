@@ -491,18 +491,22 @@ class BotGame:
                 current_turn = len(self.turn_history)
                 owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
                 
-                # Only stay if this lighthouse needs defense or we have few lighthouses
+                # Only stay if this lighthouse needs immediate defense
                 should_defend = False
-                if len(owned_lighthouses) <= 2:  # Keep defending if we have few lighthouses
+                
+                # Check if enemies are nearby threatening this lighthouse
+                for lh in turn.Lighthouses:
+                    if lh.Owner != self.player_num and lh.Owner != 0:
+                        enemy_distance = abs(lh.Position.X - cx) + abs(lh.Position.Y - cy)
+                        if enemy_distance <= 2:  # Enemy is very close
+                            should_defend = True
+                            break
+                
+                # Also defend if we have very few lighthouses AND this one is strategic
+                if (len(owned_lighthouses) <= 1 and 
+                    ((cx, cy) in self.corner_positions or 
+                     cx == 0 or cx == 14 or cy == 0 or cy == 14)):
                     should_defend = True
-                else:
-                    # Check if enemies are nearby threatening this lighthouse
-                    for lh in turn.Lighthouses:
-                        if lh.Owner != self.player_num and lh.Owner != 0:
-                            enemy_distance = abs(lh.Position.X - cx) + abs(lh.Position.Y - cy)
-                            if enemy_distance <= 3:  # Enemy is close
-                                should_defend = True
-                                break
                 
                 # If we don't need to defend, move away to find new targets
                 if not should_defend:
@@ -542,18 +546,19 @@ class BotGame:
                         self.countT += 1
                         return action
             else:
-                # Not our lighthouse, try to attack it
+                # Not our lighthouse, try to attack it to claim/capture it
                 lighthouse_energy = lighthouses[(cx, cy)].Energy
-                if turn.Energy > lighthouse_energy:
-                    min_energy = lighthouse_energy + 1
+                min_energy = lighthouse_energy + 1
+                
+                # For unowned lighthouses (Owner == 0), we just need 1 energy
+                if lighthouses[(cx, cy)].Owner == 0:
+                    min_energy = 1
+                
+                if turn.Energy >= min_energy:
+                    # Use optimized energy allocation but ensure we can attack
+                    optimal_energy = self.optimize_energy_allocation(turn, min_energy)
+                    energy = max(min_energy, min(optimal_energy, turn.Energy - max(5, self.energy_reserve // 2)))
                     
-                    # Use optimized energy allocation
-                    optimal_energy = self.optimize_energy_allocation(turn, min_energy + lighthouse_energy)
-                    
-                    if optimal_energy >= min_energy:
-                        energy = min(optimal_energy, turn.Energy - self.energy_reserve)
-                    else:
-                        energy = min_energy
                     action = game_pb2.NewAction(
                         Action=game_pb2.ATTACK,
                         Energy=energy,
