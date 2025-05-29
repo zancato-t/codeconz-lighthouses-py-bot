@@ -31,6 +31,8 @@ class BotGame:
         self.map_height = 15
         self.corner_positions = [(0, 0), (0, 14), (14, 0), (14, 14)]
         self.known_lighthouse_positions = set()  # Track all lighthouse positions
+        self.turns_on_lighthouse = 0  # Track how long we've been on same lighthouse
+        self.last_lighthouse_pos = None  # Track last lighthouse position
 
     def calculate_triangle_potential(self, new_pos, owned_lighthouses):
         """Calculate potential triangle area if we capture this lighthouse"""
@@ -118,7 +120,13 @@ class BotGame:
         self.lastY = cy
         self.lastX = cx
         
-
+        # Track time on lighthouse
+        current_pos = (cx, cy)
+        if current_pos == self.last_lighthouse_pos:
+            self.turns_on_lighthouse += 1
+        else:
+            self.turns_on_lighthouse = 0
+            
         lighthouses = dict()
         for lh in turn.Lighthouses:
             pos = (lh.Position.X, lh.Position.Y)
@@ -127,8 +135,14 @@ class BotGame:
             self.known_lighthouse_positions.add(pos)
 
         if (cx, cy) in lighthouses:
+            self.last_lighthouse_pos = current_pos
+            
+            # Force movement if we've been camping too long (3 turns max)
+            if self.turns_on_lighthouse >= 3:
+                # Skip to movement logic below
+                pass
             # Conectar con faro remoto válido si podemos
-            if lighthouses[(cx, cy)].Owner == self.player_num:
+            elif lighthouses[(cx, cy)].Owner == self.player_num:
                 possible_connections = []
                 for dest in lighthouses:
                     # No conectar con sigo mismo
@@ -165,9 +179,11 @@ class BotGame:
                     self.countT += 1
                     return action
 
-            lighthouse_energy = lighthouses[(cx, cy)].Energy
-            if turn.Energy > lighthouse_energy:
-                min_energy = lighthouse_energy + 1
+            # Skip attack if we've been camping too long
+            elif self.turns_on_lighthouse < 3:
+                lighthouse_energy = lighthouses[(cx, cy)].Energy
+                if turn.Energy > lighthouse_energy:
+                    min_energy = lighthouse_energy + 1
                 energy_ratio = turn.Energy / max(min_energy, 1)
                 
                 # Calculate optimal investment based on strategic value
@@ -193,29 +209,23 @@ class BotGame:
                     # Moderate extra investment in edges
                     energy = min(energy + 10, turn.Energy - 20)
                 
-                # Don't over-invest early game
-                if owned_count < 3 and energy > turn.Energy * 0.7:
+                # More aggressive energy spending for expansion
+                if owned_count < 3 and energy > turn.Energy * 0.6:
+                    energy = int(turn.Energy * 0.5)  # Keep more energy for movement
+                elif owned_count < 6 and energy > turn.Energy * 0.7:
                     energy = int(turn.Energy * 0.6)
-                action = game_pb2.NewAction(
-                    Action=game_pb2.ATTACK,
-                    Energy=energy,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
+                    action = game_pb2.NewAction(
+                        Action=game_pb2.ATTACK,
+                        Energy=energy,
+                        Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
+                    )
+                    bgt = BotGameTurn(turn, action)
+                    self.turn_states.append(bgt)
 
-                self.countT += 1
-                return action
-            else:
-                action = game_pb2.NewAction(
-                    Action=game_pb2.PASS,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
-
-                self.countT += 1
-                return action
+                    self.countT += 1
+                    return action
+            # NEVER PASS in 12-player game - always be moving!
+            # Force movement logic below
 
         best_lighthouse = None
         best_score = float('-inf')
@@ -227,8 +237,8 @@ class BotGame:
             
             score = 0
             
-            # Distance penalty (Manhattan distance)
-            score -= distance * 1.5
+            # Distance penalty (reduced for more aggressive expansion)
+            score -= distance * 1.0
             
             # Strategic position bonuses
             if (lh_x, lh_y) in self.corner_positions:
@@ -246,18 +256,21 @@ class BotGame:
                 # Center positions for connectivity
                 score += 25
             
-            # Ownership status
-            if lh.Owner == 0:  # Unowned - highest priority
-                score += 60
-            elif lh.Owner != self.player_num:  # Enemy owned
-                score += 40
-                # Bonus for stealing from enemies (but be conservative)
-                if turn.Energy > lh.Energy + 30:
-                    score += 25
-                elif turn.Energy > lh.Energy + 15:
-                    score += 10
-            else:  # Already ours - lowest priority unless strategic
-                score += 5
+            # Ownership status (12-player ultra-aggressive priorities)
+            if lh.Owner == 0:  # Unowned - absolute top priority
+                score += 150  # Massive bonus for new territory
+            elif lh.Owner != self.player_num:  # Enemy owned - steal aggressively
+                score += 100  # High priority to disrupt enemies
+                # Ultra-aggressive stealing (attack with ANY advantage)
+                if turn.Energy > lh.Energy - 5:
+                    score += 60  # Attack even at slight disadvantage
+                elif turn.Energy > lh.Energy - 15:
+                    score += 30
+            else:  # Already ours - strong penalty to force constant expansion
+                score -= 60  # Big negative to prevent camping
+                # Small exception for strategic positions
+                if (lh_x, lh_y) in self.corner_positions:
+                    score += 30  # Corners still somewhat valuable
             
             # Energy efficiency calculation
             if lh.Owner != self.player_num:
@@ -352,14 +365,15 @@ class BotGame:
                 new_x = turn.Position.X + move[0]
                 new_y = turn.Position.Y + move[1]
             else:
-                action = game_pb2.NewAction(
-                    Action=game_pb2.PASS,
-                    Destination=game_pb2.Position(X=turn.Position.X, Y=turn.Position.Y),
-                )
-                bgt = BotGameTurn(turn, action)
-                self.turn_states.append(bgt)
-                self.countT += 1
-                return action
+                # Can't find valid move but NEVER PASS - try random direction
+                for _ in range(10):  # Try 10 times to find ANY valid move
+                    dx, dy = random.choice([-1, 0, 1]), random.choice([-1, 0, 1])
+                    if dx == 0 and dy == 0:
+                        continue
+                    test_x, test_y = turn.Position.X + dx, turn.Position.Y + dy
+                    if 0 <= test_x < self.map_width and 0 <= test_y < self.map_height:
+                        new_x, new_y = test_x, test_y
+                        break
 
         action = game_pb2.NewAction(
             Action=game_pb2.MOVE,
