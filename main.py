@@ -141,47 +141,111 @@ class BotGame:
     def calculate_zone_control_value(self, pos, lighthouses):
         x, y = pos
         value = 0
+        current_turn = len(self.turn_history)
         
-        # Corner positions are extremely valuable
+        # Dynamic corner and edge valuation based on game phase
         if pos in self.corner_positions:
-            value += 200
-        # Edge positions are valuable
+            corner_value = 250  # Increased base value
+            # Early game: corners are extremely important
+            if current_turn < 25:
+                corner_value += 100
+            # Late game: still valuable but less critical
+            elif current_turn > 60:
+                corner_value -= 50
+            value += corner_value
+            
+        # Edge positions are valuable, especially in early game
         elif x == 0 or x == 14 or y == 0 or y == 14:
-            value += 50
+            edge_value = 60
+            if current_turn < 30:
+                edge_value += 30  # Early game bonus for edge control
+            value += edge_value
+            
         # Center positions provide good connectivity
         elif 6 <= x <= 8 and 6 <= y <= 8:
-            value += 30
+            center_value = 35
+            # Mid-game: center becomes more valuable for connections
+            if 20 <= current_turn <= 50:
+                center_value += 20
+            value += center_value
             
-        # Small bonus for being near our lighthouses (reduced defensive bias)
+        # Strategic ring positions (one step from edges)
+        elif ((x == 1 or x == 13) and 1 <= y <= 13) or ((y == 1 or y == 13) and 1 <= x <= 13):
+            value += 25  # Secondary strategic positions
+            
+        # Connectivity bonus for being near our lighthouses
         owned_lighthouses = [lh for lh in lighthouses if lh.Owner == self.player_num]
+        
+        # Calculate potential triangle areas with owned lighthouses
+        triangle_potential = 0
+        if len(owned_lighthouses) >= 1:
+            for i, lh1 in enumerate(owned_lighthouses):
+                pos1 = (lh1.Position.X, lh1.Position.Y)
+                for lh2 in owned_lighthouses[i+1:]:
+                    pos2 = (lh2.Position.X, lh2.Position.Y)
+                    area = self.calculate_triangle_area(pos, pos1, pos2)
+                    triangle_potential = max(triangle_potential, area)
+        
+        value += triangle_potential * 1.5
+        
+        # Proximity bonus (reduced defensive bias but still useful)
         for lh in owned_lighthouses:
             distance = abs(x - lh.Position.X) + abs(y - lh.Position.Y)
-            if distance <= 2:
-                value += 8 - distance * 3
+            if distance <= 3:
+                proximity_bonus = max(0, 12 - distance * 3)
+                value += proximity_bonus
                 
-        # Reduced penalty for being in threat zones
+        # Dynamic threat zone penalty
         if pos in self.threat_zones:
-            value -= 15
+            threat_penalty = 20
+            # Early game: less concerned about threats, focus on expansion
+            if current_turn < 15:
+                threat_penalty = 5
+            # Late game: more careful about threats
+            elif current_turn > 50:
+                threat_penalty = 35
+            value -= threat_penalty
             
         return value
 
     def optimize_energy_allocation(self, turn, target_energy_needed):
         current_energy = turn.Energy
+        current_turn = len(self.turn_history)
         
-        # Calculate dynamic energy reserve based on threats
-        base_reserve = 20
+        # Calculate dynamic energy reserve based on threats and game phase
+        base_reserve = 15  # Reduced base reserve for more aggressive play
+        
+        # Early game: be more aggressive with energy
+        if current_turn < 20:
+            base_reserve = 10
+        # Mid game: standard reserve
+        elif current_turn < 50:
+            base_reserve = 15
+        # Late game: more conservative to protect positions
+        else:
+            base_reserve = 25
+            
         threat_multiplier = len(self.threat_zones) // 20
         enemy_nearby = any(lh.Owner != self.player_num and lh.Owner != 0 
                           for lh in turn.Lighthouses 
                           if abs(lh.Position.X - turn.Position.X) + abs(lh.Position.Y - turn.Position.Y) <= 2)
         
+        # More nuanced energy management
+        owned_lighthouses = len([lh for lh in turn.Lighthouses if lh.Owner == self.player_num])
+        
         if enemy_nearby:
-            dynamic_reserve = base_reserve + 15
+            dynamic_reserve = base_reserve + 10
+        elif owned_lighthouses >= 3:  # We have good position, be more aggressive
+            dynamic_reserve = max(base_reserve - 5, 5)
         else:
-            dynamic_reserve = base_reserve + threat_multiplier * 5
+            dynamic_reserve = base_reserve + threat_multiplier * 3
             
-        # Calculate available energy for actions
+        # Calculate available energy for actions with efficiency bonus
         available_energy = max(0, current_energy - dynamic_reserve)
+        
+        # Energy efficiency bonus for high-value targets
+        if target_energy_needed > current_energy * 0.7:
+            available_energy = min(current_energy - 5, available_energy + 10)
         
         return min(available_energy, target_energy_needed)
 
@@ -218,7 +282,8 @@ class BotGame:
             return None
             
         best_target = None
-        max_area = 0
+        max_score = 0
+        current_turn = len(self.turn_history)
         
         for target in owned_lighthouses:
             target_pos = (target.Position.X, target.Position.Y)
@@ -231,15 +296,48 @@ class BotGame:
                     continue
                     
                 area = self.calculate_triangle_area((cx, cy), target_pos, third_pos)
+                score = area
                 
-                # Bonus for corner-to-corner connections (massive triangles)
+                # Enhanced corner bonuses based on game phase
+                corner_bonus = 0
                 if target_pos in self.corner_positions and third_pos in self.corner_positions:
-                    area += 100  # Huge bonus for corner triangles
+                    corner_bonus = 150  # Massive bonus for corner-to-corner triangles
                 elif target_pos in self.corner_positions or third_pos in self.corner_positions:
-                    area += 25   # Smaller bonus for one corner
+                    corner_bonus = 60   # Good bonus for one corner
+                    
+                # Early game: prioritize corner control
+                if current_turn < 30:
+                    corner_bonus *= 1.5
+                    
+                score += corner_bonus
                 
-                if area > max_area:
-                    max_area = area
+                # Bonus for edge positions (creates defensive barriers)
+                edge_count = 0
+                for pos in [target_pos, third_pos]:
+                    x, y = pos
+                    if x == 0 or x == 14 or y == 0 or y == 14:
+                        edge_count += 1
+                score += edge_count * 20
+                
+                # Strategic positioning bonus
+                # Prefer triangles that span multiple quadrants
+                quadrants = set()
+                for pos in [(cx, cy), target_pos, third_pos]:
+                    qx, qy = pos
+                    quadrant = (qx >= 7, qy >= 7)
+                    quadrants.add(quadrant)
+                    
+                if len(quadrants) >= 2:
+                    score += 40  # Multi-quadrant triangle bonus
+                    
+                # Perimeter bonus - triangles with larger perimeter control more territory
+                perimeter = (abs(cx - target_pos[0]) + abs(cy - target_pos[1]) +
+                           abs(target_pos[0] - third_pos[0]) + abs(target_pos[1] - third_pos[1]) +
+                           abs(third_pos[0] - cx) + abs(third_pos[1] - cy))
+                score += perimeter * 2
+                
+                if score > max_score:
+                    max_score = score
                     best_target = target_pos
                     
         return best_target
@@ -356,9 +454,11 @@ class BotGame:
         # Enhanced lighthouse targeting with multiple strategies
         best_lighthouse = None
         best_score = float('-inf')
+        current_turn = len(self.turn_history)
         
         # Check for blocking opportunities first
         blocking_positions = self.find_blocking_positions(turn)
+        owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
         
         for lh in turn.Lighthouses:
             lh_x, lh_y = lh.Position.X, lh.Position.Y
@@ -374,38 +474,76 @@ class BotGame:
             distance = len(path) - 1
             score = 0
             
-            # Reduced distance penalty to encourage exploration
-            score -= distance * 0.8
+            # Dynamic distance penalty based on game phase
+            if current_turn < 15:  # Early game: explore more
+                score -= distance * 0.5
+            elif current_turn < 40:  # Mid game: balanced
+                score -= distance * 0.7
+            else:  # Late game: prefer closer targets
+                score -= distance * 1.0
             
-            # Zone control value
+            # Zone control value with game phase modifier
             zone_value = self.calculate_zone_control_value(lh_pos, turn.Lighthouses)
+            if current_turn < 20:  # Early game bonus for corners
+                if lh_pos in self.corner_positions:
+                    zone_value += 50
             score += zone_value
             
             # Blocking bonus
             blocking_bonus = next((value for pos, value in blocking_positions if pos == lh_pos), 0)
             score += blocking_bonus
             
-            # Ownership considerations with exploration bonus
+            # Triangle potential scoring
+            triangle_potential = 0
+            if len(owned_lighthouses) >= 1:
+                for owned_lh in owned_lighthouses:
+                    owned_pos = (owned_lh.Position.X, owned_lh.Position.Y)
+                    if len(owned_lighthouses) >= 2:
+                        for other_owned in owned_lighthouses:
+                            other_pos = (other_owned.Position.X, other_owned.Position.Y)
+                            if owned_pos != other_pos:
+                                area = self.calculate_triangle_area(lh_pos, owned_pos, other_pos)
+                                triangle_potential = max(triangle_potential, area)
+            score += triangle_potential * 2
+            
+            # Ownership considerations with improved logic
             if lh.Owner == 0:  # Unowned
-                score += 85
-                # Bonus for exploring distant unowned lighthouses
-                if distance > 5:
-                    score += 25
+                base_unowned_bonus = 100
+                # Early game: prioritize corners and edges
+                if current_turn < 25 and lh_pos in self.corner_positions:
+                    base_unowned_bonus += 75
+                elif current_turn < 25 and (lh_x == 0 or lh_x == 14 or lh_y == 0 or lh_y == 14):
+                    base_unowned_bonus += 35
+                score += base_unowned_bonus
+                
+                # Bonus for distant exploration in early game
+                if current_turn < 20 and distance > 4:
+                    score += 30
             elif lh.Owner != self.player_num:  # Enemy owned
-                score += 60
+                base_enemy_bonus = 70
+                # Higher priority to disrupt enemy strongholds
+                enemy_lighthouse_count = len([l for l in turn.Lighthouses if l.Owner == lh.Owner])
+                if enemy_lighthouse_count >= 3:
+                    base_enemy_bonus += 25
+                score += base_enemy_bonus
+                
                 # Extra bonus for disrupting enemy triangles
                 if lh_pos in [pos for pos, _ in blocking_positions[:3]]:
-                    score += 40
+                    score += 50
             else:  # Already ours
-                score += 15
+                score += 20  # Slight bonus for reinforcing our positions
             
-            # Energy efficiency
+            # Improved energy efficiency calculation
             if lh.Owner != self.player_num:
-                available_energy = self.optimize_energy_allocation(turn, lh.Energy + 1)
-                if available_energy > lh.Energy:
-                    score += (available_energy - lh.Energy) // 8
+                required_energy = lh.Energy + 1
+                available_energy = self.optimize_energy_allocation(turn, required_energy)
+                
+                if available_energy >= required_energy:
+                    efficiency_bonus = min(20, (available_energy - required_energy) // 5)
+                    score += efficiency_bonus
                 else:
-                    score -= (lh.Energy - available_energy) // 3
+                    energy_deficit = required_energy - available_energy
+                    score -= energy_deficit * 2  # Penalty for insufficient energy
             
             if score > best_score:
                 best_score = score
@@ -428,24 +566,70 @@ class BotGame:
                 dy = 0 if target_y == cy else (1 if target_y > cy else -1)
                 move = (dx, dy)
         else:
-            # Strategic positioning when no clear target
+            # Enhanced strategic positioning when no clear target
             strategic_moves = []
+            current_turn = len(self.turn_history)
+            
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
                     if dx == 0 and dy == 0:
                         continue
                     test_pos = (cx + dx, cy + dy)
-                    if (0 <= test_pos[0] < self.map_width and 0 <= test_pos[1] < self.map_height and
-                        test_pos not in self.threat_zones):
+                    if (0 <= test_pos[0] < self.map_width and 0 <= test_pos[1] < self.map_height):
                         zone_value = self.calculate_zone_control_value(test_pos, turn.Lighthouses)
+                        
+                        # Early game: prioritize corner/edge exploration
+                        if current_turn < 20:
+                            if test_pos in self.corner_positions:
+                                zone_value += 150
+                            elif test_pos[0] == 0 or test_pos[0] == 14 or test_pos[1] == 0 or test_pos[1] == 14:
+                                zone_value += 75
+                        
+                        # Avoid threat zones but don't completely exclude them
+                        if test_pos in self.threat_zones:
+                            zone_value -= 30
+                        
+                        # Exploration bonus for unseen areas
+                        if test_pos not in [pos for pos in self.known_lighthouse_positions]:
+                            zone_value += 20
+                        
                         strategic_moves.append(((dx, dy), zone_value))
             
             if strategic_moves:
                 strategic_moves.sort(key=lambda x: x[1], reverse=True)
-                move = strategic_moves[0][0]
+                # Add some randomness to avoid predictable patterns
+                if len(strategic_moves) > 1 and current_turn > 10:
+                    # 70% chance to pick best, 30% chance to pick second best
+                    if random.random() < 0.7:
+                        move = strategic_moves[0][0]
+                    else:
+                        move = strategic_moves[1][0]
+                else:
+                    move = strategic_moves[0][0]
             else:
-                moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
-                move = random.choice(moves)
+                # Fallback movement with bias toward edges in early game
+                if current_turn < 15:
+                    # Prefer moves toward edges/corners in early game
+                    edge_moves = []
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            if dx == 0 and dy == 0:
+                                continue
+                            new_x, new_y = cx + dx, cy + dy
+                            if (0 <= new_x < self.map_width and 0 <= new_y < self.map_height):
+                                # Prioritize moves toward edges
+                                edge_distance = min(new_x, new_y, 14 - new_x, 14 - new_y)
+                                if edge_distance <= 2:
+                                    edge_moves.append((dx, dy))
+                    
+                    if edge_moves:
+                        move = random.choice(edge_moves)
+                    else:
+                        moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+                        move = random.choice(moves)
+                else:
+                    moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+                    move = random.choice(moves)
         
         new_x = turn.Position.X + move[0]
         new_y = turn.Position.Y + move[1]
