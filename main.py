@@ -32,6 +32,28 @@ class BotGame:
         self.corner_positions = [(0, 0), (0, 14), (14, 0), (14, 14)]
         self.known_lighthouse_positions = set()  # Track all lighthouse positions
 
+    def calculate_triangle_potential(self, new_pos, owned_lighthouses):
+        """Calculate potential triangle area if we capture this lighthouse"""
+        if len(owned_lighthouses) < 1:
+            return 0
+            
+        max_potential = 0
+        for lh1 in owned_lighthouses:
+            pos1 = (lh1.Position.X, lh1.Position.Y)
+            if len(owned_lighthouses) >= 2:
+                for lh2 in owned_lighthouses:
+                    pos2 = (lh2.Position.X, lh2.Position.Y)
+                    if pos1 != pos2:
+                        area = self.calculate_triangle_area(new_pos, pos1, pos2)
+                        if area > max_potential:
+                            max_potential = area
+            else:
+                # With only one owned lighthouse, estimate potential
+                distance = abs(new_pos[0] - pos1[0]) + abs(new_pos[1] - pos1[1])
+                max_potential = distance * 2  # Rough estimate
+        
+        return min(max_potential // 3, 50)  # Cap the bonus
+
     def calculate_triangle_area(self, p1, p2, p3):
         """Calculate area of triangle using shoelace formula"""
         x1, y1 = p1
@@ -47,29 +69,46 @@ class BotGame:
             return None
             
         best_target = None
-        max_area = 0
+        max_score = 0
         
         for target in owned_lighthouses:
             target_pos = (target.Position.X, target.Position.Y)
             if target_pos == (cx, cy):
                 continue
                 
+            connection_score = 0
+            max_triangle_area = 0
+            
             for third in owned_lighthouses:
                 third_pos = (third.Position.X, third.Position.Y)
                 if third_pos == (cx, cy) or third_pos == target_pos:
                     continue
                     
                 area = self.calculate_triangle_area((cx, cy), target_pos, third_pos)
+                max_triangle_area = max(max_triangle_area, area)
                 
-                # Bonus for corner-to-corner connections (massive triangles)
-                if target_pos in self.corner_positions and third_pos in self.corner_positions:
-                    area += 100  # Huge bonus for corner triangles
-                elif target_pos in self.corner_positions or third_pos in self.corner_positions:
-                    area += 25   # Smaller bonus for one corner
-                
-                if area > max_area:
-                    max_area = area
-                    best_target = target_pos
+            # Base score from triangle area
+            connection_score = max_triangle_area
+            
+            # Strategic position bonuses
+            if target_pos in self.corner_positions:
+                if (cx, cy) in self.corner_positions:
+                    connection_score += 200  # Corner to corner - massive bonus
+                else:
+                    connection_score += 80   # To corner - large bonus
+            
+            # Distance penalty (prefer closer connections first)
+            distance = abs(cx - target_pos[0]) + abs(cy - target_pos[1])
+            connection_score -= distance * 2
+            
+            # Bonus for creating new triangles vs extending existing ones
+            creates_new_triangle = max_triangle_area > 0
+            if creates_new_triangle:
+                connection_score += 50
+            
+            if connection_score > max_score:
+                max_score = connection_score
+                best_target = target_pos
                     
         return best_target
 
@@ -131,13 +170,32 @@ class BotGame:
                 min_energy = lighthouse_energy + 1
                 energy_ratio = turn.Energy / max(min_energy, 1)
                 
-                if energy_ratio >= 3.0:
+                # Calculate optimal investment based on strategic value
+                is_corner = (cx, cy) in self.corner_positions
+                is_edge = cx == 0 or cx == 14 or cy == 0 or cy == 14
+                owned_count = len([lh for lh in turn.Lighthouses if lh.Owner == self.player_num])
+                
+                # Base energy calculation
+                if energy_ratio >= 4.0:
                     energy = min(min_energy + (lighthouse_energy // 2), turn.Energy // 2)
-                elif energy_ratio >= 2.0:
-                    # Ensure we don't go negative and keep minimum reserve
-                    energy = min(min_energy + (lighthouse_energy // 4), max(turn.Energy - 50, min_energy))
+                elif energy_ratio >= 2.5:
+                    energy = min(min_energy + (lighthouse_energy // 3), turn.Energy // 3)
+                elif energy_ratio >= 1.5:
+                    energy = min(min_energy + (lighthouse_energy // 4), max(turn.Energy - 30, min_energy))
                 else:
                     energy = min_energy
+                
+                # Strategic adjustments
+                if is_corner and owned_count < 2:
+                    # Invest more in first corners for triangle potential
+                    energy = min(energy + 20, turn.Energy - 10)
+                elif is_edge and owned_count < 4:
+                    # Moderate extra investment in edges
+                    energy = min(energy + 10, turn.Energy - 20)
+                
+                # Don't over-invest early game
+                if owned_count < 3 and energy > turn.Energy * 0.7:
+                    energy = int(turn.Energy * 0.6)
                 action = game_pb2.NewAction(
                     Action=game_pb2.ATTACK,
                     Energy=energy,
@@ -161,35 +219,60 @@ class BotGame:
 
         best_lighthouse = None
         best_score = float('-inf')
+        owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
+        
         for lh in turn.Lighthouses:
             lh_x, lh_y = lh.Position.X, lh.Position.Y
             distance = abs(cx - lh_x) + abs(cy - lh_y)
             
             score = 0
             
-            score -= distance * 2
+            # Distance penalty (Manhattan distance)
+            score -= distance * 1.5
             
+            # Strategic position bonuses
             if (lh_x, lh_y) in self.corner_positions:
-                score += 100
-            
+                # Corners are extremely valuable for triangle formation
+                score += 150
+                # Extra bonus if we already own another corner
+                owned_corners = sum(1 for olh in owned_lighthouses 
+                                  if (olh.Position.X, olh.Position.Y) in self.corner_positions)
+                if owned_corners > 0:
+                    score += 100
             elif lh_x == 0 or lh_x == 14 or lh_y == 0 or lh_y == 14:
-                score += 30
-                
+                # Edge positions good for large triangles
+                score += 40
             elif 6 <= lh_x <= 8 and 6 <= lh_y <= 8:
-                score += 20
+                # Center positions for connectivity
+                score += 25
             
-            if lh.Owner == 0:  # Unowned
-                score += 50
+            # Ownership status
+            if lh.Owner == 0:  # Unowned - highest priority
+                score += 60
             elif lh.Owner != self.player_num:  # Enemy owned
-                score += 30
-            else:  # Already ours
-                score += 10
+                score += 40
+                # Bonus for stealing from enemies (but be conservative)
+                if turn.Energy > lh.Energy + 30:
+                    score += 25
+                elif turn.Energy > lh.Energy + 15:
+                    score += 10
+            else:  # Already ours - lowest priority unless strategic
+                score += 5
             
+            # Energy efficiency calculation
             if lh.Owner != self.player_num:
-                if turn.Energy > lh.Energy:
-                    score += (turn.Energy - lh.Energy) // 10
+                energy_diff = turn.Energy - lh.Energy
+                if energy_diff > 0:
+                    # Bonus for easy captures
+                    score += min(energy_diff // 8, 30)
                 else:
-                    score -= (lh.Energy - turn.Energy) // 5
+                    # Heavy penalty for impossible captures
+                    score -= (abs(energy_diff) // 3)
+            
+            # Triangle potential bonus
+            if len(owned_lighthouses) >= 1:
+                triangle_bonus = self.calculate_triangle_potential((lh_x, lh_y), owned_lighthouses)
+                score += triangle_bonus
             
             if score > best_score:
                 best_score = score
@@ -201,13 +284,28 @@ class BotGame:
             dy = 0 if target_y == cy else (1 if target_y > cy else -1)
             move = (dx, dy)
         else:
-            moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
-            move = random.choice(moves)
+            # If no target, prefer edge/corner exploration
+            edge_moves = []
+            center_moves = []
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    new_x, new_y = cx + dx, cy + dy
+                    if 0 <= new_x < self.map_width and 0 <= new_y < self.map_height:
+                        # Prefer moves toward edges/corners
+                        if (new_x <= 2 or new_x >= 12 or new_y <= 2 or new_y >= 12):
+                            edge_moves.append((dx, dy))
+                        else:
+                            center_moves.append((dx, dy))
+            
+            move = random.choice(edge_moves if edge_moves else center_moves) if (edge_moves or center_moves) else (0, 0)
         
         new_x = turn.Position.X + move[0]
         new_y = turn.Position.Y + move[1]
         
         if new_x == self.lastX and new_y == self.lastY:
+            # Avoid backtracking - find best alternative move
             alternative_moves = []
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
@@ -215,11 +313,24 @@ class BotGame:
                         continue
                     test_x = turn.Position.X + dx
                     test_y = turn.Position.Y + dy
-                    if test_x != self.lastX or test_y != self.lastY:
-                        alternative_moves.append((dx, dy))
+                    if (test_x != self.lastX or test_y != self.lastY) and \
+                       0 <= test_x < self.map_width and 0 <= test_y < self.map_height:
+                        # Score alternative moves
+                        move_score = 0
+                        # Prefer continuing in same general direction
+                        if best_lighthouse:
+                            target_x, target_y = best_lighthouse
+                            if (test_x - cx) * (target_x - cx) >= 0:  # Same x direction
+                                move_score += 1
+                            if (test_y - cy) * (target_y - cy) >= 0:  # Same y direction
+                                move_score += 1
+                        alternative_moves.append(((dx, dy), move_score))
             
             if alternative_moves:
-                move = random.choice(alternative_moves)
+                # Choose best scoring alternative, or random if tied
+                max_score = max(score for _, score in alternative_moves)
+                best_alternatives = [move for move, score in alternative_moves if score == max_score]
+                move = random.choice(best_alternatives)
                 new_x = turn.Position.X + move[0]
                 new_y = turn.Position.Y + move[1]
         
