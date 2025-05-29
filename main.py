@@ -2,6 +2,10 @@ import argparse
 import random
 import time
 from concurrent import futures
+import heapq
+import math
+from collections import defaultdict, deque
+from typing import List, Tuple, Dict, Set, Optional
 
 import grpc
 from google.protobuf import json_format
@@ -31,6 +35,17 @@ class BotGame:
         self.map_height = 15
         self.corner_positions = [(0, 0), (0, 14), (14, 0), (14, 14)]
         self.known_lighthouse_positions = set()  # Track all lighthouse positions
+        self.enemy_positions = defaultdict(list)  # Track enemy movement history
+        self.enemy_patterns = {}  # Predicted enemy movement patterns
+        self.current_path = []  # Current planned path
+        self.path_target = None  # Current pathfinding target
+        self.energy_reserve = 50  # Minimum energy to keep in reserve
+        self.turn_history = []  # Track game state history
+        self.threat_zones = set()  # Areas under enemy threat
+        self.pathfinding_cache = {}  # Cache for pathfinding results
+        self.enemy_lighthouse_control = {}  # Track enemy lighthouse control timing
+        self.strategic_zones = set()  # High-value strategic positions
+        self.connection_threats = []  # Enemy connection attempts to block
 
     def calculate_triangle_area(self, p1, p2, p3):
         """Calculate area of triangle using shoelace formula"""
@@ -38,6 +53,171 @@ class BotGame:
         x2, y2 = p2
         x3, y3 = p3
         return abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2.0)
+
+    def heuristic(self, a, b):
+        """Manhattan distance heuristic for A*"""
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def get_neighbors(self, pos):
+        """Get valid neighboring positions"""
+        x, y = pos
+        neighbors = []
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
+                    neighbors.append((nx, ny))
+        return neighbors
+
+    def a_star_pathfind(self, start, goal, obstacles=None):
+        """A* pathfinding algorithm"""
+        if obstacles is None:
+            obstacles = set()
+            
+        cache_key = (start, goal, tuple(sorted(obstacles)))
+        if cache_key in self.pathfinding_cache:
+            return self.pathfinding_cache[cache_key]
+            
+        if start == goal:
+            return [start]
+            
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
+        
+        while open_set:
+            current = heapq.heappop(open_set)[1]
+            
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.append(start)
+                path.reverse()
+                self.pathfinding_cache[cache_key] = path
+                return path
+                
+            for neighbor in self.get_neighbors(current):
+                if neighbor in obstacles:
+                    continue
+                    
+                tentative_g_score = g_score[current] + 1
+                
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = g_score[neighbor] + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                    
+        return None  # No path found
+
+    def predict_enemy_movement(self, turn):
+        """Predict enemy movement patterns and update threat zones"""
+        current_turn = len(self.turn_history)
+        
+        # Track enemy positions
+        for player_id in range(1, 5):  # Assuming max 4 players
+            if player_id == self.player_num:
+                continue
+                
+            # Find enemy position (simplified - in real game you'd track this better)
+            enemy_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == player_id]
+            
+            if enemy_lighthouses:
+                # Predict enemy will try to connect their lighthouses
+                for i, lh1 in enumerate(enemy_lighthouses):
+                    for lh2 in enemy_lighthouses[i+1:]:
+                        # Mark areas between enemy lighthouses as threat zones
+                        x1, y1 = lh1.Position.X, lh1.Position.Y
+                        x2, y2 = lh2.Position.X, lh2.Position.Y
+                        
+                        # Add points along the line as threats
+                        steps = max(abs(x2-x1), abs(y2-y1))
+                        if steps > 0:
+                            for step in range(steps + 1):
+                                threat_x = x1 + (x2-x1) * step // steps
+                                threat_y = y1 + (y2-y1) * step // steps
+                                self.threat_zones.add((threat_x, threat_y))
+
+    def calculate_zone_control_value(self, pos, lighthouses):
+        """Calculate strategic value of a position for zone control"""
+        x, y = pos
+        value = 0
+        
+        # Corner positions are extremely valuable
+        if pos in self.corner_positions:
+            value += 200
+        # Edge positions are valuable
+        elif x == 0 or x == 14 or y == 0 or y == 14:
+            value += 50
+        # Center positions provide good connectivity
+        elif 6 <= x <= 8 and 6 <= y <= 8:
+            value += 30
+            
+        # Bonus for being near our lighthouses (defensive value)
+        owned_lighthouses = [lh for lh in lighthouses if lh.Owner == self.player_num]
+        for lh in owned_lighthouses:
+            distance = abs(x - lh.Position.X) + abs(y - lh.Position.Y)
+            if distance <= 3:
+                value += 20 - distance * 5
+                
+        # Penalty for being in threat zones
+        if pos in self.threat_zones:
+            value -= 30
+            
+        return value
+
+    def optimize_energy_allocation(self, turn, target_energy_needed):
+        """Optimize energy allocation based on game state"""
+        current_energy = turn.Energy
+        
+        # Calculate dynamic energy reserve based on threats
+        base_reserve = 50
+        threat_multiplier = len(self.threat_zones) // 10
+        enemy_nearby = any(lh.Owner != self.player_num and lh.Owner != 0 
+                          for lh in turn.Lighthouses 
+                          if abs(lh.Position.X - turn.Position.X) + abs(lh.Position.Y - turn.Position.Y) <= 3)
+        
+        if enemy_nearby:
+            dynamic_reserve = base_reserve + 30
+        else:
+            dynamic_reserve = base_reserve + threat_multiplier * 10
+            
+        # Calculate available energy for actions
+        available_energy = max(0, current_energy - dynamic_reserve)
+        
+        return min(available_energy, target_energy_needed)
+
+    def find_blocking_positions(self, turn):
+        """Find positions to block enemy connections"""
+        blocking_positions = []
+        
+        # Look for enemy lighthouse pairs that could form valuable connections
+        enemy_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner != self.player_num and lh.Owner != 0]
+        
+        for i, lh1 in enumerate(enemy_lighthouses):
+            for lh2 in enemy_lighthouses[i+1:]:
+                if lh1.Owner == lh2.Owner:  # Same enemy player
+                    x1, y1 = lh1.Position.X, lh1.Position.Y
+                    x2, y2 = lh2.Position.X, lh2.Position.Y
+                    
+                    # Calculate midpoint as blocking position
+                    mid_x = (x1 + x2) // 2
+                    mid_y = (y1 + y2) // 2
+                    
+                    # Check if blocking position is strategically valuable
+                    if (mid_x, mid_y) in self.corner_positions:
+                        blocking_positions.append(((mid_x, mid_y), 100))
+                    elif mid_x == 0 or mid_x == 14 or mid_y == 0 or mid_y == 14:
+                        blocking_positions.append(((mid_x, mid_y), 50))
+                    else:
+                        blocking_positions.append(((mid_x, mid_y), 25))
+                        
+        return sorted(blocking_positions, key=lambda x: x[1], reverse=True)
 
     def find_best_connection(self, current_pos, owned_lighthouses):
         """Find the connection that creates the largest triangle area"""
@@ -79,13 +259,26 @@ class BotGame:
         self.lastY = cy
         self.lastX = cx
         
-
+        # Update turn history for analysis
+        self.turn_history.append(turn)
+        
+        # Predict enemy movements and update threat assessment
+        self.predict_enemy_movement(turn)
+        
         lighthouses = dict()
         for lh in turn.Lighthouses:
             pos = (lh.Position.X, lh.Position.Y)
             lighthouses[pos] = lh
             # Memorize all lighthouse positions we've seen
             self.known_lighthouse_positions.add(pos)
+            
+            # Track enemy lighthouse control timing
+            if lh.Owner != self.player_num and lh.Owner != 0:
+                if pos not in self.enemy_lighthouse_control:
+                    self.enemy_lighthouse_control[pos] = len(self.turn_history)
+                    
+        # Update strategic zones based on current game state
+        self.update_strategic_zones(lighthouses)
 
         if (cx, cy) in lighthouses:
             # Conectar con faro remoto válido si podemos
@@ -108,9 +301,20 @@ class BotGame:
                 if possible_connections:
                     owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
                     
+                    # Enhanced connection strategy with blocking consideration
                     best_connection = self.find_best_connection((cx, cy), owned_lighthouses)
                     
-                    if best_connection and best_connection in possible_connections:
+                    # Prioritize connections that also block enemy strategies
+                    blocking_positions = self.find_blocking_positions(turn)
+                    blocking_targets = [pos for pos, _ in blocking_positions]
+                    
+                    strategic_connections = [conn for conn in possible_connections if conn in blocking_targets]
+                    
+                    if strategic_connections and best_connection in strategic_connections:
+                        possible_connection = best_connection
+                    elif strategic_connections:
+                        possible_connection = strategic_connections[0]
+                    elif best_connection and best_connection in possible_connections:
                         possible_connection = best_connection
                     else:
                         possible_connection = random.choice(possible_connections)
@@ -129,13 +333,12 @@ class BotGame:
             lighthouse_energy = lighthouses[(cx, cy)].Energy
             if turn.Energy > lighthouse_energy:
                 min_energy = lighthouse_energy + 1
-                energy_ratio = turn.Energy / max(min_energy, 1)
                 
-                if energy_ratio >= 3.0:
-                    energy = min(min_energy + (lighthouse_energy // 2), turn.Energy // 2)
-                elif energy_ratio >= 2.0:
-                    # Ensure we don't go negative and keep minimum reserve
-                    energy = min(min_energy + (lighthouse_energy // 4), max(turn.Energy - 50, min_energy))
+                # Use optimized energy allocation
+                optimal_energy = self.optimize_energy_allocation(turn, min_energy + lighthouse_energy)
+                
+                if optimal_energy >= min_energy:
+                    energy = min(optimal_energy, turn.Energy - self.energy_reserve)
                 else:
                     energy = min_energy
                 action = game_pb2.NewAction(
@@ -159,50 +362,96 @@ class BotGame:
                 self.countT += 1
                 return action
 
+        # Enhanced lighthouse targeting with multiple strategies
         best_lighthouse = None
         best_score = float('-inf')
+        
+        # Check for blocking opportunities first
+        blocking_positions = self.find_blocking_positions(turn)
+        
         for lh in turn.Lighthouses:
             lh_x, lh_y = lh.Position.X, lh.Position.Y
-            distance = abs(cx - lh_x) + abs(cy - lh_y)
+            lh_pos = (lh_x, lh_y)
             
+            # Use A* pathfinding for accurate distance calculation
+            obstacles = self.threat_zones.copy()
+            path = self.a_star_pathfind((cx, cy), lh_pos, obstacles)
+            
+            if path is None:
+                continue  # No valid path
+                
+            distance = len(path) - 1
             score = 0
             
-            score -= distance * 2
+            # Distance penalty (less penalty for strategic positions)
+            score -= distance * 1.5
             
-            if (lh_x, lh_y) in self.corner_positions:
-                score += 100
+            # Zone control value
+            zone_value = self.calculate_zone_control_value(lh_pos, turn.Lighthouses)
+            score += zone_value
             
-            elif lh_x == 0 or lh_x == 14 or lh_y == 0 or lh_y == 14:
-                score += 30
-                
-            elif 6 <= lh_x <= 8 and 6 <= lh_y <= 8:
-                score += 20
+            # Blocking bonus
+            blocking_bonus = next((value for pos, value in blocking_positions if pos == lh_pos), 0)
+            score += blocking_bonus
             
+            # Ownership considerations
             if lh.Owner == 0:  # Unowned
-                score += 50
+                score += 75
             elif lh.Owner != self.player_num:  # Enemy owned
-                score += 30
+                score += 50
+                # Extra bonus for disrupting enemy triangles
+                if lh_pos in [pos for pos, _ in blocking_positions[:3]]:
+                    score += 40
             else:  # Already ours
-                score += 10
+                score += 15
             
+            # Energy efficiency
             if lh.Owner != self.player_num:
-                if turn.Energy > lh.Energy:
-                    score += (turn.Energy - lh.Energy) // 10
+                available_energy = self.optimize_energy_allocation(turn, lh.Energy + 1)
+                if available_energy > lh.Energy:
+                    score += (available_energy - lh.Energy) // 8
                 else:
-                    score -= (lh.Energy - turn.Energy) // 5
+                    score -= (lh.Energy - available_energy) // 3
             
             if score > best_score:
                 best_score = score
-                best_lighthouse = (lh_x, lh_y)
+                best_lighthouse = lh_pos
         
         if best_lighthouse:
-            target_x, target_y = best_lighthouse
-            dx = 0 if target_x == cx else (1 if target_x > cx else -1)
-            dy = 0 if target_y == cy else (1 if target_y > cy else -1)
-            move = (dx, dy)
+            # Use A* pathfinding for movement
+            obstacles = self.threat_zones.copy()
+            path = self.a_star_pathfind((cx, cy), best_lighthouse, obstacles)
+            
+            if path and len(path) > 1:
+                next_pos = path[1]
+                dx = next_pos[0] - cx
+                dy = next_pos[1] - cy
+                move = (dx, dy)
+            else:
+                # Fallback to direct movement
+                target_x, target_y = best_lighthouse
+                dx = 0 if target_x == cx else (1 if target_x > cx else -1)
+                dy = 0 if target_y == cy else (1 if target_y > cy else -1)
+                move = (dx, dy)
         else:
-            moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
-            move = random.choice(moves)
+            # Strategic positioning when no clear target
+            strategic_moves = []
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    test_pos = (cx + dx, cy + dy)
+                    if (0 <= test_pos[0] < self.map_width and 0 <= test_pos[1] < self.map_height and
+                        test_pos not in self.threat_zones):
+                        zone_value = self.calculate_zone_control_value(test_pos, turn.Lighthouses)
+                        strategic_moves.append(((dx, dy), zone_value))
+            
+            if strategic_moves:
+                strategic_moves.sort(key=lambda x: x[1], reverse=True)
+                move = strategic_moves[0][0]
+            else:
+                moves = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+                move = random.choice(moves)
         
         new_x = turn.Position.X + move[0]
         new_y = turn.Position.Y + move[1]
@@ -260,6 +509,34 @@ class BotGame:
 
         self.countT += 1
         return action
+        
+    def update_strategic_zones(self, lighthouses):
+        """Update strategic zones based on current lighthouse positions"""
+        self.strategic_zones.clear()
+        
+        # Identify key strategic positions
+        owned_lighthouses = [(lh.Position.X, lh.Position.Y) for lh in lighthouses.values() if lh.Owner == self.player_num]
+        
+        # Add positions that could form large triangles with our lighthouses
+        for i, pos1 in enumerate(owned_lighthouses):
+            for pos2 in owned_lighthouses[i+1:]:
+                # Find third point that would create maximum triangle area
+                for pos3 in self.corner_positions:
+                    if pos3 not in owned_lighthouses:
+                        area = self.calculate_triangle_area(pos1, pos2, pos3)
+                        if area > 50:  # Significant area threshold
+                            self.strategic_zones.add(pos3)
+                            
+        # Add defensive positions around our lighthouses
+        for pos in owned_lighthouses:
+            x, y = pos
+            for dx in [-2, -1, 0, 1, 2]:
+                for dy in [-2, -1, 0, 1, 2]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    def_pos = (x + dx, y + dy)
+                    if (0 <= def_pos[0] < self.map_width and 0 <= def_pos[1] < self.map_height):
+                        self.strategic_zones.add(def_pos)
 
 
 class BotComs:
