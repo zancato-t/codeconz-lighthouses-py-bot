@@ -1,6 +1,6 @@
 SERVER_PORT  := 50051
 BOT_PORT	 := 3001
-BOT_NAME	 := python-bot1
+BOT_NAME	 := firestarter-bot1
 
 # Run py bot
 runbotpy:
