@@ -37,6 +37,37 @@ class BotGame:
         self.enemy_lighthouses = defaultdict(set)  # player_id -> set of (x,y) positions
         self.turn_number = 0  # Track game progression
         self.enemy_connections = defaultdict(list)  # Track enemy connections for disruption
+        
+        # HARDCODED LIGHTHOUSE POSITIONS - THE CHEEKY ADVANTAGE!
+        self.fixed_lighthouses = {
+            (9, 0), (2, 1), (12, 1), (6, 2), (3, 3), 
+            (0, 4), (9, 4), (14, 4), (4, 5), (12, 5),
+            (6, 7), (10, 7), (13, 7), (1, 8), (3, 9), (11, 9),
+            (5, 11), (10, 11), (13, 11), (3, 13), (13, 13), (8, 14)
+        }
+        
+        # Pre-calculated optimal triangle formations (sorted by area)
+        self.mega_triangles = [
+            # Corner mega-triangles (area ~98-112)
+            [(0, 4), (14, 4), (8, 14)],   # Top corners to bottom
+            [(0, 4), (13, 13), (14, 4)],  # Wide top triangle
+            
+            # Edge-based large triangles (area ~60-80)
+            [(9, 0), (3, 13), (13, 13)],  # Top to bottom edges
+            [(2, 1), (12, 1), (8, 14)],   # Near-top to bottom
+            
+            # Strategic mid-size triangles (area ~40-60)
+            [(0, 4), (9, 4), (5, 11)],    # Left side triangle
+            [(9, 4), (14, 4), (10, 11)],  # Right side triangle
+        ]
+        
+        # Optimal paths from each corner spawn
+        self.corner_rush_targets = {
+            (0, 0): [(2, 1), (0, 4), (3, 3)],      # Top-left spawn
+            (14, 0): [(12, 1), (14, 4), (13, 7)],  # Top-right spawn
+            (0, 14): [(3, 13), (1, 8), (0, 4)],    # Bottom-left spawn
+            (14, 14): [(13, 13), (13, 7), (14, 4)] # Bottom-right spawn
+        }
 
     def calculate_triangle_potential(self, new_pos, owned_lighthouses):
         """Calculate potential triangle area if we capture this lighthouse"""
@@ -181,6 +212,16 @@ class BotGame:
         self.lastX = cx
         self.turn_number += 1
         
+        # Initialize spawn corner on first turn for optimal pathing
+        if self.turn_number == 1:
+            self.spawn_corner = None
+            min_dist = 999
+            for corner in self.corner_positions:
+                dist = abs(cx - corner[0]) + abs(cy - corner[1])
+                if dist < min_dist:
+                    min_dist = dist
+                    self.spawn_corner = corner
+        
         # Track time on lighthouse
         current_pos = (cx, cy)
         if current_pos == self.last_lighthouse_pos:
@@ -298,13 +339,12 @@ class BotGame:
                         energy = min_energy
                     max_spend_ratio = 0.7  # Can spend more late game
                 
-                # Strategic position adjustments
-                if is_corner and owned_count < 2:
-                    # First corners are critical
-                    energy = min(energy + 15, turn.Energy * 0.6)
-                elif is_edge and owned_count < 4:
-                    # Edges valuable for triangles
-                    energy = min(energy + 10, turn.Energy * 0.5)
+                # CHEEKY SPEEDRUN: Always use minimal energy to maximize expansion
+                # With 12 players, quantity > quality
+                if self.turn_number < 15:
+                    energy = min_energy  # Absolute minimum early game
+                else:
+                    energy = min(min_energy + 5, turn.Energy * 0.3)  # Still very conservative
                 
                 # Hard cap based on game phase
                 max_allowed = int(turn.Energy * max_spend_ratio)
@@ -330,15 +370,44 @@ class BotGame:
         best_lighthouse = None
         best_score = float('-inf')
         owned_lighthouses = [lh for lh in turn.Lighthouses if lh.Owner == self.player_num]
+        owned_positions = {(lh.Position.X, lh.Position.Y) for lh in owned_lighthouses}
         
-        for lh in turn.Lighthouses:
-            lh_x, lh_y = lh.Position.X, lh.Position.Y
-            distance = abs(cx - lh_x) + abs(cy - lh_y)
-            
-            score = 0
-            
-            # Distance penalty (minimal for ultra-aggressive expansion)
-            score -= distance * 0.5
+        # CHEEKY STRATEGY: Use pre-planned routes based on spawn corner
+        if self.turn_number <= 10 and hasattr(self, 'spawn_corner') and self.spawn_corner in self.corner_rush_targets:
+            # Follow optimal early game path
+            for target_pos in self.corner_rush_targets[self.spawn_corner]:
+                if target_pos not in owned_positions and target_pos in self.fixed_lighthouses:
+                    # Check if this lighthouse exists in current game state
+                    for lh in turn.Lighthouses:
+                        if (lh.Position.X, lh.Position.Y) == target_pos:
+                            best_lighthouse = target_pos
+                            break
+                    if best_lighthouse:
+                        break
+        
+        # If no pre-planned target or after early game, use smart scoring
+        if not best_lighthouse:
+            for lh in turn.Lighthouses:
+                lh_x, lh_y = lh.Position.X, lh.Position.Y
+                distance = abs(cx - lh_x) + abs(cy - lh_y)
+                
+                score = 0
+                
+                # Distance penalty (minimal for ultra-aggressive expansion)
+                score -= distance * 0.5
+                
+                # CHEEKY BONUS: Prioritize lighthouses that form our pre-calculated mega triangles
+                pos = (lh_x, lh_y)
+                for triangle in self.mega_triangles:
+                    if pos in triangle:
+                        # Count how many of this triangle we already own
+                        owned_in_triangle = sum(1 for t_pos in triangle if t_pos in owned_positions)
+                        if owned_in_triangle == 2:
+                            score += 500  # MASSIVE bonus to complete triangle
+                        elif owned_in_triangle == 1:
+                            score += 150  # Good bonus to continue triangle
+                        else:
+                            score += 50   # Small bonus to start triangle
             
             # Strategic position bonuses
             if (lh_x, lh_y) in self.corner_positions:
@@ -415,9 +484,25 @@ class BotGame:
             elif cluster_density >= 2:
                 score += 20  # Moderate density bonus
             
-            if score > best_score:
-                best_score = score
-                best_lighthouse = (lh_x, lh_y)
+                if score > best_score:
+                    best_score = score
+                    best_lighthouse = (lh_x, lh_y)
+        
+        # ULTRA CHEEKY: If we have 2+ lighthouses, always move toward completing triangles
+        if len(owned_lighthouses) >= 2 and not best_lighthouse:
+            # Find the nearest lighthouse that would complete a large triangle
+            for triangle in self.mega_triangles:
+                owned_in_triangle = [(pos, pos in owned_positions) for pos in triangle]
+                if sum(owned for _, owned in owned_in_triangle) == 2:
+                    # We own 2, find the missing one
+                    for pos, owned in owned_in_triangle:
+                        if not owned and pos in self.fixed_lighthouses:
+                            dist = abs(cx - pos[0]) + abs(cy - pos[1])
+                            if dist < 10:  # Reasonably close
+                                best_lighthouse = pos
+                                break
+                    if best_lighthouse:
+                        break
         
         if best_lighthouse:
             target_x, target_y = best_lighthouse
