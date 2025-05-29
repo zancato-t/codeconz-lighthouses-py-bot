@@ -26,8 +26,9 @@ class BotGame:
         self.initial_state = None
         self.turn_states = []
         self.countT = 1
-        self.lastY = 0
-        self.lastX = 0
+        self.lastY = -1  # Initialize to invalid position
+        self.lastX = -1  # Initialize to invalid position
+        self.stuck_counter = 0  # Track if we're stuck in same area
         self.map_width = 15  # Fixed map size
         self.map_height = 15
         self.corner_positions = [(0, 0), (0, 14), (14, 0), (14, 14)]
@@ -208,6 +209,12 @@ class BotGame:
     def new_turn_action(self, turn: game_pb2.NewTurn) -> game_pb2.NewAction:
         cx, cy = turn.Position.X, turn.Position.Y
         
+        # Check if we're stuck (same position as 2 turns ago)
+        if cx == self.lastX and cy == self.lastY:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+        
         self.lastY = cy
         self.lastX = cx
         self.turn_number += 1
@@ -255,7 +262,7 @@ class BotGame:
                 # Skip to movement logic below - ALWAYS BE MOVING!
                 pass
             # Conectar con faro remoto válido si podemos
-            elif lighthouses[(cx, cy)].Owner == self.player_num:
+            elif self.turns_on_lighthouse == 0 and lighthouses[(cx, cy)].Owner == self.player_num:
                 possible_connections = []
                 for dest in lighthouses:
                     # No conectar con sigo mismo
@@ -308,7 +315,7 @@ class BotGame:
                         return action
 
             # Skip attack if we've been camping too long
-            elif self.turns_on_lighthouse < 1:  # Only attack on first turn at lighthouse
+            elif self.turns_on_lighthouse == 0:  # Only attack on first turn at lighthouse
                 lighthouse_energy = lighthouses[(cx, cy)].Energy
                 if turn.Energy > lighthouse_energy:
                     min_energy = lighthouse_energy + 1
@@ -484,9 +491,9 @@ class BotGame:
             elif cluster_density >= 2:
                 score += 20  # Moderate density bonus
             
-                if score > best_score:
-                    best_score = score
-                    best_lighthouse = (lh_x, lh_y)
+            if score > best_score:
+                best_score = score
+                best_lighthouse = (lh_x, lh_y)
         
         # ULTRA CHEEKY: If we have 2+ lighthouses, always move toward completing triangles
         if len(owned_lighthouses) >= 2 and not best_lighthouse:
@@ -530,33 +537,21 @@ class BotGame:
         new_x = turn.Position.X + move[0]
         new_y = turn.Position.Y + move[1]
         
-        if new_x == self.lastX and new_y == self.lastY:
-            # Avoid backtracking - find best alternative move
-            alternative_moves = []
+        # Only avoid backtracking if we're actually stuck
+        if self.stuck_counter > 2:
+            # Force a random move to break out of stuck pattern
+            valid_moves = []
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
                     if dx == 0 and dy == 0:
                         continue
                     test_x = turn.Position.X + dx
                     test_y = turn.Position.Y + dy
-                    if (test_x != self.lastX or test_y != self.lastY) and \
-                       0 <= test_x < self.map_width and 0 <= test_y < self.map_height:
-                        # Score alternative moves
-                        move_score = 0
-                        # Prefer continuing in same general direction
-                        if best_lighthouse:
-                            target_x, target_y = best_lighthouse
-                            if (test_x - cx) * (target_x - cx) >= 0:  # Same x direction
-                                move_score += 1
-                            if (test_y - cy) * (target_y - cy) >= 0:  # Same y direction
-                                move_score += 1
-                        alternative_moves.append(((dx, dy), move_score))
+                    if 0 <= test_x < self.map_width and 0 <= test_y < self.map_height:
+                        valid_moves.append((dx, dy))
             
-            if alternative_moves:
-                # Choose best scoring alternative, or random if tied
-                max_score = max(score for _, score in alternative_moves)
-                best_alternatives = [move for move, score in alternative_moves if score == max_score]
-                move = random.choice(best_alternatives)
+            if valid_moves:
+                move = random.choice(valid_moves)
                 new_x = turn.Position.X + move[0]
                 new_y = turn.Position.Y + move[1]
         
